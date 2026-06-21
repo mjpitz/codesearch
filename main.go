@@ -15,10 +15,12 @@ func main() {
 		Description: "Quickly and easily search large code bases for relevant documentation.",
 		Commands: []*cli.Command{
 			cmd.Init,
-			cmd.Sync,
-			cmd.Status,
+			cmd.Facets,
+			cmd.Fields,
 			cmd.Query,
 			cmd.Serve,
+			cmd.Status,
+			cmd.Sync,
 		},
 	}
 
