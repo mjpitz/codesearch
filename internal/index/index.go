@@ -16,7 +16,12 @@ import (
 // underlying bbolt lock. Bleve uses bbolt.DefaultOptions, which has
 // Timeout = 0 (block forever). We override briefly during open so a stuck
 // reader or writer surfaces as an actionable error instead of a hang.
-const openLockTimeout = 5 * time.Second
+//
+// Sized to comfortably outlast a typical MCP tool call: while serve is
+// holding the read lock to service a search/facets request, a parallel
+// `codesearch sync` from a git hook will retry the flock until the
+// daemon releases via its LazyIndex idle timer.
+const openLockTimeout = 30 * time.Second
 
 // Index wraps bleve.Index with the Upsert/Delete/Iterate surface that the
 // sync, query, and MCP layers consume.

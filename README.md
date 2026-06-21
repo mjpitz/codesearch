@@ -114,3 +114,10 @@ The codesearch tool offers a number MCP tools that can be invoked across the rep
 | codesearch_fields | List every indexed field name in the codesearch index. Use the returned names with codesearch_facets or as keys in codesearch_search's fields filter. |
 | codesearch_get    | Return the contents of a repo-relative path. Refuses absolute paths and `..` escapes. Truncates beyond max_bytes (default 65536, hard cap 262144).    |
 | codesearch_status | Report doc count, on-disk index size, schema version, and last sync time.                                                                             |
+
+## Known Limitations
+
+- Due to our use of a Bleve index under the hood, there can only be one active process reading the
+  index at a time. To mitigate this issue, our MCP server maintains a lazy reference that's opened
+  at the start of a request when no existing handle exists and closed after a specific idle window
+  (30s).

@@ -7,17 +7,19 @@ import (
 	"github.com/mjpitz/codesearch/internal/index"
 )
 
-// Serve opens the index in read-only mode and serves the codesearch tool
-// suite over stdio until EOF. cfg.Root and cfg.IndexPath() must already
-// exist (run `codesearch init && codesearch sync` first). Read-only mode
-// lets a concurrent `codesearch sync` (e.g. from a git hook) hold the
-// writer lock without blocking the server.
+// Serve runs the codesearch MCP server on stdio until EOF.
+//
+// The index is opened lazily on the first tool call and released after
+// an idle window (see index.LazyIndex). This is what lets a concurrent
+// `codesearch sync` (e.g. from a git hook) acquire the writer lock
+// between bursts of MCP traffic — the server doesn't hoard the OS file
+// lock when no tool calls are in flight.
+//
+// cfg.Root and cfg.IndexPath() must already exist (run `codesearch init
+// && codesearch sync` first).
 func Serve(cfg *config.IndexConfig) error {
-	idx, err := index.OpenReadOnly(cfg.IndexPath())
-	if err != nil {
-		return err
-	}
-	defer func() { _ = idx.Close() }()
+	lazy := index.NewLazy(cfg.IndexPath(), index.DefaultIdleTimeout, index.DefaultRetryBudget)
+	defer func() { _ = lazy.Close() }()
 
 	srv := server.NewMCPServer(
 		"codesearch",
@@ -25,7 +27,7 @@ func Serve(cfg *config.IndexConfig) error {
 		server.WithToolCapabilities(false),
 	)
 
-	registerTools(srv, cfg, idx)
+	registerTools(srv, cfg, lazy)
 
 	return server.ServeStdio(srv)
 }

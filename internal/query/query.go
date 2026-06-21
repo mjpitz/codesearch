@@ -24,12 +24,12 @@ type Request struct {
 
 // Hit is one ranked search result.
 type Hit struct {
-	Path    string             `json:"path"`
-	Score   float64            `json:"score"`
-	Title   string             `json:"title,omitempty"`
-	Tags    []string           `json:"tags,omitempty"`
-	Snippet string             `json:"snippet,omitempty"`
-	Extras  map[string]any     `json:"extras,omitempty"`
+	Path    string              `json:"path"`
+	Score   float64             `json:"score"`
+	Title   string              `json:"title,omitempty"`
+	Tags    []string            `json:"tags,omitempty"`
+	Snippet string              `json:"snippet,omitempty"`
+	Extras  map[string]any      `json:"extras,omitempty"`
 	Frags   map[string][]string `json:"fragments,omitempty"`
 }
 

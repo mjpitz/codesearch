@@ -25,13 +25,16 @@ const (
 	facetDefaultLimit  = 50
 )
 
-// registerTools attaches the codesearch_* MCP tools to srv.
-func registerTools(srv *server.MCPServer, cfg *config.IndexConfig, idx *index.Index) {
-	srv.AddTool(searchTool(), mcp.NewStructuredToolHandler(searchHandler(cfg, idx)))
-	srv.AddTool(facetsTool(), mcp.NewStructuredToolHandler(facetsHandler(idx)))
-	srv.AddTool(fieldsTool(), fieldsHandler(idx))
+// registerTools attaches the codesearch_* MCP tools to srv. Each tool
+// that touches the index acquires the shared handle from lazy on entry
+// and releases it on return, so the OS file lock is released between
+// bursts of requests.
+func registerTools(srv *server.MCPServer, cfg *config.IndexConfig, lazy *index.LazyIndex) {
+	srv.AddTool(searchTool(), mcp.NewStructuredToolHandler(searchHandler(cfg, lazy)))
+	srv.AddTool(facetsTool(), mcp.NewStructuredToolHandler(facetsHandler(lazy)))
+	srv.AddTool(fieldsTool(), fieldsHandler(lazy))
 	srv.AddTool(getTool(), mcp.NewStructuredToolHandler(getHandler(cfg)))
-	srv.AddTool(statusTool(), statusHandler(cfg, idx))
+	srv.AddTool(statusTool(), statusHandler(cfg, lazy))
 }
 
 // --- search ---
@@ -39,6 +42,7 @@ func registerTools(srv *server.MCPServer, cfg *config.IndexConfig, idx *index.In
 func searchTool() mcp.Tool {
 	return mcp.NewTool("codesearch_search",
 		mcp.WithDescription("Ranked full-text search across indexed docs and configs. Returns ranked hits with path, score, title, snippet."),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("query",
 			mcp.Required(),
 			mcp.Description("Search terms. Empty matches all docs."),
@@ -55,8 +59,14 @@ func searchTool() mcp.Tool {
 	)
 }
 
-func searchHandler(cfg *config.IndexConfig, idx *index.Index) func(context.Context, mcp.CallToolRequest, SearchArgs) (*query.Result, error) {
+func searchHandler(cfg *config.IndexConfig, lazy *index.LazyIndex) func(context.Context, mcp.CallToolRequest, SearchArgs) (*query.Result, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest, args SearchArgs) (*query.Result, error) {
+		idx, release, err := lazy.Acquire()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+
 		r := query.Request{
 			Terms:     args.Query,
 			Fields:    args.Fields,
@@ -73,6 +83,7 @@ func searchHandler(cfg *config.IndexConfig, idx *index.Index) func(context.Conte
 func facetsTool() mcp.Tool {
 	return mcp.NewTool("codesearch_facets",
 		mcp.WithDescription("Return the distinct values seen in a given indexed field, with document counts. Use codesearch_fields to discover field names."),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("field",
 			mcp.Required(),
 			mcp.Description("Field name to facet on (e.g. tags, service.name, doc_type)."),
@@ -85,7 +96,7 @@ func facetsTool() mcp.Tool {
 	)
 }
 
-func facetsHandler(idx *index.Index) func(context.Context, mcp.CallToolRequest, FacetsArgs) ([]FacetResult, error) {
+func facetsHandler(lazy *index.LazyIndex) func(context.Context, mcp.CallToolRequest, FacetsArgs) ([]FacetResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest, args FacetsArgs) ([]FacetResult, error) {
 		if strings.TrimSpace(args.Field) == "" {
 			return nil, errors.New("field is required")
@@ -94,6 +105,12 @@ func facetsHandler(idx *index.Index) func(context.Context, mcp.CallToolRequest, 
 		if limit <= 0 {
 			limit = facetDefaultLimit
 		}
+
+		idx, release, err := lazy.Acquire()
+		if err != nil {
+			return nil, err
+		}
+		defer release()
 
 		bleveReq := bleve.NewSearchRequestOptions(bleve.NewMatchAllQuery(), 0, 0, false)
 		bleveReq.AddFacet(args.Field, bleve.NewFacetRequest(args.Field, limit))
@@ -120,11 +137,18 @@ func facetsHandler(idx *index.Index) func(context.Context, mcp.CallToolRequest, 
 func fieldsTool() mcp.Tool {
 	return mcp.NewTool("codesearch_fields",
 		mcp.WithDescription("List every indexed field name in the codesearch index. Use the returned names with codesearch_facets or as keys in codesearch_search's fields filter."),
+		mcp.WithDestructiveHintAnnotation(false),
 	)
 }
 
-func fieldsHandler(idx *index.Index) server.ToolHandlerFunc {
+func fieldsHandler(lazy *index.LazyIndex) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		idx, release, err := lazy.Acquire()
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
+
 		fields, err := idx.Bleve().Fields()
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
@@ -138,6 +162,7 @@ func fieldsHandler(idx *index.Index) server.ToolHandlerFunc {
 func getTool() mcp.Tool {
 	return mcp.NewTool("codesearch_get",
 		mcp.WithDescription("Return the contents of a repo-relative path. Refuses absolute paths and `..` escapes. Truncates beyond max_bytes (default 65536, hard cap 262144)."),
+		mcp.WithDestructiveHintAnnotation(false),
 		mcp.WithString("path",
 			mcp.Required(),
 			mcp.Description("Repo-relative path (forward slashes)."),
@@ -211,11 +236,18 @@ func resolveRepoPath(root, rel string) (string, error) {
 func statusTool() mcp.Tool {
 	return mcp.NewTool("codesearch_status",
 		mcp.WithDescription("Report doc count, on-disk index size, schema version, and last sync time."),
+		mcp.WithDestructiveHintAnnotation(false),
 	)
 }
 
-func statusHandler(cfg *config.IndexConfig, idx *index.Index) server.ToolHandlerFunc {
+func statusHandler(cfg *config.IndexConfig, lazy *index.LazyIndex) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		idx, release, err := lazy.Acquire()
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		defer release()
+
 		count, err := idx.DocCount()
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil

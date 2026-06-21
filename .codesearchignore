@@ -1,0 +1,10 @@
+.codegraph/
+.git/
+.codesearch/
+
+# editor / IDE state
+.vscode/
+.idea/
+
+# OS noise
+.DS_Store
