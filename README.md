@@ -115,6 +115,24 @@ The codesearch tool offers a number MCP tools that can be invoked across the rep
 | codesearch_get    | Return the contents of a repo-relative path. Refuses absolute paths and `..` escapes. Truncates beyond max_bytes (default 65536, hard cap 262144).    |
 | codesearch_status | Report doc count, on-disk index size, schema version, and last sync time.                                                                             |
 
+## Page Rank - Boosts
+
+Markdown files have a distinct advantage in this ecosystem due to their support for frontmatter.
+As a result, `codesearch` attempts to to parse out YAML frontmatter and extract common fields
+related to SEO.
+
+```go
+// DefaultBoosts are the query-time field boosts applied when an indexed
+// field is present.
+var DefaultBoosts = map[string]float64{
+	"title":       5.0,
+	"tags":        2.0,
+	"body":        1.0,
+	"description": 3.0,
+	"keywords":    4.0,
+}
+```
+
 ## Known Limitations
 
 - Due to our use of a Bleve index under the hood, there can only be one active process reading the
