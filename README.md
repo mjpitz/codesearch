@@ -97,7 +97,7 @@ clients depending on the task at hand.
     "codesearch": {
       "type": "stdio",
       "command": "codesearch",
-      "args": ["serve", "--mcp"]
+      "args": ["serve"]
     }
   }
 }
