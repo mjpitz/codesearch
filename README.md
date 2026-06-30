@@ -13,6 +13,10 @@ Agents to query non-code related artifacts and navigate in-repository documentat
 ## Installation
 
 ```shell
+# Precompiled Binary
+brew install mjpitz/tap/codesearch
+
+# Using Go
 go install github.com/mjpitz/codesearch@latest
 ```
 
