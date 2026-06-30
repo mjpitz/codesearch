@@ -1,0 +1,48 @@
+# yaml-language-server: $schema=https://goreleaser.com/static/schema.json
+# vim: set ts=2 sw=2 tw=0 fo=cnqoj
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+
+builds:
+  - id: codesearch
+    main: .
+    env:
+      - CGO_ENABLED=0
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+
+upx:
+  - enabled: true
+
+archives:
+  - id: codesearch
+    name_template: "codesearch_{{ .Os }}_{{ .Arch }}"
+    ids: [codesearch]
+    formats: [tar.gz]
+
+checksum:
+  algorithm: sha256
+  name_template: "checksums.txt"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+
+homebrew_casks:
+  - name: codesearch
+    ids: [codesearch]
+    binaries: [codesearch]
+    homepage: https://github.com/mjpitz/codesearch
+    description: A free-text search tool that helps AI agents easily locate documentation and infrastructure configuration (like Helm or Terraform) across entire codebases.
+    repository:
+      owner: mjpitz
+      name: homebrew-tap
+      token: "{{ .Env.GORELEASER_AUTH_TOKEN }}"
