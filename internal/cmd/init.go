@@ -22,7 +22,7 @@ var Init = &cli.Command{
 	Name:  "init",
 	Usage: "Create an empty codesearch index at .codesearch/.",
 	Action: func(ctx context.Context, c *cli.Command) error {
-		cfg, err := config.Load("")
+		cfg, err := config.LoadOrInit("")
 		if err != nil {
 			return err
 		}
