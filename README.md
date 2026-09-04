@@ -107,9 +107,38 @@ clients depending on the task at hand.
 }
 ```
 
+Every `codesearch_*` tool accepts an optional `project_path` (absolute path
+to the repo, or any directory inside it). The server walks up from that path
+to find `.git` and expects `.codesearch/` there. Agents like Cline — which
+spawn MCP servers with `cwd: /` and don't substitute `${workspaceFolder}` in
+config args (see [cline#2990](https://github.com/cline/cline/pull/2990),
+[#5147](https://github.com/cline/cline/discussions/5147)) — should pass
+`project_path` on each call.
+
+For single-repo setups you can also pass `--root <abs-path>` to `serve`:
+
+```json
+"codesearch": {
+  "type": "stdio",
+  "command": "codesearch",
+  "args": ["serve", "--root", "/abs/path/to/your/repo"]
+}
+```
+
+When `--root` is set it becomes the default project; tool calls that omit
+`project_path` fall through to it. When `--root` is unset, tool calls
+without `project_path` return a clear error asking the agent to supply it.
+
+If Cline can't find the binary (`spawn codesearch ENOENT`), hardcode
+`command` too — e.g. `/opt/homebrew/bin/codesearch` — since VSCode's
+extension host PATH usually excludes Homebrew when launched from Finder/Dock.
+
 ### Tools
 
 The codesearch tool offers a number MCP tools that can be invoked across the repository.
+Every tool accepts an optional `project_path` (absolute path to the repo or any directory
+inside it); when omitted, calls fall back to the server's default project (`--root`) or
+error if none is set.
 
 | Tool              | Description                                                                                                                                           |
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |

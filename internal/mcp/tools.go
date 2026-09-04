@@ -23,18 +23,39 @@ const (
 	getDefaultMaxBytes = 64 * 1024
 	getHardMaxBytes    = 256 * 1024
 	facetDefaultLimit  = 50
+
+	projectPathDescription = "Absolute path to the project to query (or any directory inside it). " +
+		"codesearch walks up to find .git and expects .codesearch/ there. " +
+		"Omit to use this session's default project (set at server start via --root)."
 )
 
 // registerTools attaches the codesearch_* MCP tools to srv. Each tool
-// that touches the index acquires the shared handle from lazy on entry
-// and releases it on return, so the OS file lock is released between
-// bursts of requests.
-func registerTools(srv *server.MCPServer, cfg *config.IndexConfig, lazy *index.LazyIndex) {
-	srv.AddTool(searchTool(), mcp.NewStructuredToolHandler(searchHandler(cfg, lazy)))
-	srv.AddTool(facetsTool(), mcp.NewStructuredToolHandler(facetsHandler(lazy)))
-	srv.AddTool(fieldsTool(), fieldsHandler(lazy))
-	srv.AddTool(getTool(), mcp.NewStructuredToolHandler(getHandler(cfg)))
-	srv.AddTool(statusTool(), statusHandler(cfg, lazy))
+// accepts an optional project_path so a single server can answer against
+// multiple repos; the pool holds one LazyIndex per resolved index path.
+// defaultCfg may be nil — when it is, tools require project_path.
+func registerTools(srv *server.MCPServer, defaultCfg *config.IndexConfig, pool *index.Pool) {
+	srv.AddTool(searchTool(), mcp.NewStructuredToolHandler(searchHandler(defaultCfg, pool)))
+	srv.AddTool(facetsTool(), mcp.NewStructuredToolHandler(facetsHandler(defaultCfg, pool)))
+	srv.AddTool(fieldsTool(), fieldsHandler(defaultCfg, pool))
+	srv.AddTool(getTool(), mcp.NewStructuredToolHandler(getHandler(defaultCfg)))
+	srv.AddTool(statusTool(), statusHandler(defaultCfg, pool))
+}
+
+// resolveProject picks the config for this call. project_path (when
+// provided) wins; otherwise defaultCfg (from --root) is used; otherwise
+// an actionable error is returned so the caller (usually an AI agent)
+// knows to pass project_path.
+func resolveProject(defaultCfg *config.IndexConfig, projectPath string) (*config.IndexConfig, error) {
+	if projectPath != "" {
+		if !filepath.IsAbs(projectPath) {
+			return nil, fmt.Errorf("project_path must be absolute, got %q", projectPath)
+		}
+		return config.Load(projectPath)
+	}
+	if defaultCfg != nil {
+		return defaultCfg, nil
+	}
+	return nil, errors.New("project_path is required (server has no default project; start codesearch serve with --root <path> or pass project_path per call)")
 }
 
 // --- search ---
@@ -56,12 +77,20 @@ func searchTool() mcp.Tool {
 			mcp.Min(1),
 			mcp.Max(100),
 		),
+		mcp.WithString("project_path",
+			mcp.Description(projectPathDescription),
+		),
 	)
 }
 
-func searchHandler(cfg *config.IndexConfig, lazy *index.LazyIndex) func(context.Context, mcp.CallToolRequest, SearchArgs) (*query.Result, error) {
+func searchHandler(defaultCfg *config.IndexConfig, pool *index.Pool) func(context.Context, mcp.CallToolRequest, SearchArgs) (*query.Result, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest, args SearchArgs) (*query.Result, error) {
-		idx, release, err := lazy.Acquire()
+		cfg, err := resolveProject(defaultCfg, args.ProjectPath)
+		if err != nil {
+			return nil, err
+		}
+
+		idx, release, err := pool.Get(cfg.IndexPath()).Acquire()
 		if err != nil {
 			return nil, err
 		}
@@ -93,10 +122,13 @@ func facetsTool() mcp.Tool {
 			mcp.Min(1),
 			mcp.Max(500),
 		),
+		mcp.WithString("project_path",
+			mcp.Description(projectPathDescription),
+		),
 	)
 }
 
-func facetsHandler(lazy *index.LazyIndex) func(context.Context, mcp.CallToolRequest, FacetsArgs) ([]FacetResult, error) {
+func facetsHandler(defaultCfg *config.IndexConfig, pool *index.Pool) func(context.Context, mcp.CallToolRequest, FacetsArgs) ([]FacetResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest, args FacetsArgs) ([]FacetResult, error) {
 		if strings.TrimSpace(args.Field) == "" {
 			return nil, errors.New("field is required")
@@ -106,7 +138,12 @@ func facetsHandler(lazy *index.LazyIndex) func(context.Context, mcp.CallToolRequ
 			limit = facetDefaultLimit
 		}
 
-		idx, release, err := lazy.Acquire()
+		cfg, err := resolveProject(defaultCfg, args.ProjectPath)
+		if err != nil {
+			return nil, err
+		}
+
+		idx, release, err := pool.Get(cfg.IndexPath()).Acquire()
 		if err != nil {
 			return nil, err
 		}
@@ -138,12 +175,20 @@ func fieldsTool() mcp.Tool {
 	return mcp.NewTool("codesearch_fields",
 		mcp.WithDescription("List every indexed field name in the codesearch index. Use the returned names with codesearch_facets or as keys in codesearch_search's fields filter."),
 		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithString("project_path",
+			mcp.Description(projectPathDescription),
+		),
 	)
 }
 
-func fieldsHandler(lazy *index.LazyIndex) server.ToolHandlerFunc {
+func fieldsHandler(defaultCfg *config.IndexConfig, pool *index.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		idx, release, err := lazy.Acquire()
+		cfg, err := resolveProject(defaultCfg, req.GetString("project_path", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		idx, release, err := pool.Get(cfg.IndexPath()).Acquire()
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
@@ -172,11 +217,19 @@ func getTool() mcp.Tool {
 			mcp.Min(1),
 			mcp.Max(getHardMaxBytes),
 		),
+		mcp.WithString("project_path",
+			mcp.Description(projectPathDescription),
+		),
 	)
 }
 
-func getHandler(cfg *config.IndexConfig) func(context.Context, mcp.CallToolRequest, GetArgs) (*GetResult, error) {
+func getHandler(defaultCfg *config.IndexConfig) func(context.Context, mcp.CallToolRequest, GetArgs) (*GetResult, error) {
 	return func(ctx context.Context, req mcp.CallToolRequest, args GetArgs) (*GetResult, error) {
+		cfg, err := resolveProject(defaultCfg, args.ProjectPath)
+		if err != nil {
+			return nil, err
+		}
+
 		abs, err := resolveRepoPath(cfg.Root, args.Path)
 		if err != nil {
 			return nil, err
@@ -237,12 +290,20 @@ func statusTool() mcp.Tool {
 	return mcp.NewTool("codesearch_status",
 		mcp.WithDescription("Report doc count, on-disk index size, schema version, and last sync time."),
 		mcp.WithDestructiveHintAnnotation(false),
+		mcp.WithString("project_path",
+			mcp.Description(projectPathDescription),
+		),
 	)
 }
 
-func statusHandler(cfg *config.IndexConfig, lazy *index.LazyIndex) server.ToolHandlerFunc {
+func statusHandler(defaultCfg *config.IndexConfig, pool *index.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		idx, release, err := lazy.Acquire()
+		cfg, err := resolveProject(defaultCfg, req.GetString("project_path", ""))
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+
+		idx, release, err := pool.Get(cfg.IndexPath()).Acquire()
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

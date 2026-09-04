@@ -3,21 +3,24 @@ package mcp
 
 // SearchArgs is the typed input for codesearch_search.
 type SearchArgs struct {
-	Query  string            `json:"query"`
-	Fields map[string]string `json:"fields,omitempty"`
-	Limit  int               `json:"limit,omitempty"`
+	Query       string            `json:"query"`
+	Fields      map[string]string `json:"fields,omitempty"`
+	Limit       int               `json:"limit,omitempty"`
+	ProjectPath string            `json:"project_path,omitempty"`
 }
 
 // FacetsArgs is the typed input for codesearch_facets.
 type FacetsArgs struct {
-	Field string `json:"field"`
-	Limit int    `json:"limit,omitempty"`
+	Field       string `json:"field"`
+	Limit       int    `json:"limit,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
 }
 
 // GetArgs is the typed input for codesearch_get.
 type GetArgs struct {
-	Path     string `json:"path"`
-	MaxBytes int    `json:"max_bytes,omitempty"`
+	Path        string `json:"path"`
+	MaxBytes    int    `json:"max_bytes,omitempty"`
+	ProjectPath string `json:"project_path,omitempty"`
 }
 
 // FacetResult is one term entry returned by codesearch_facets.
