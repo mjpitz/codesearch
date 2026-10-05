@@ -1,5 +1,5 @@
-// Package ignore loads .codesearchignore (gitignore syntax) and walks the
-// repo skipping ignored paths, oversized files, and binary content.
+// Package ignore loads .gitignore / .codesearchignore (gitignore syntax) and
+// walks the repo skipping ignored paths, oversized files, and binary content.
 package ignore
 
 import (
@@ -13,7 +13,7 @@ import (
 	gi "github.com/sabhiram/go-gitignore"
 )
 
-// IgnoreFileName is the per-repo ignore file read by Load.
+// IgnoreFileName is the per-repo ignore file read in addition to .gitignore.
 const IgnoreFileName = ".codesearchignore"
 
 // defaultIgnoreLines are always applied so the index never includes itself
@@ -24,42 +24,96 @@ var defaultIgnoreLines = []string{
 	".codesearch/",
 }
 
-// Matcher reports whether a repo-relative path is ignored.
+// Matcher wraps a compiled gitignore ruleset scoped to a directory. relDir is
+// repo-relative with forward slashes; "" means the repo root.
 type Matcher struct {
-	inner *gi.GitIgnore
+	inner  *gi.GitIgnore
+	relDir string
 }
 
-// Load reads root/.codesearchignore (if present) and combines it with the
-// built-in defaults. A missing ignore file is not an error.
+// Load reads root-level .gitignore and .codesearchignore (if present) and
+// combines them with the built-in defaults. Missing files are not errors.
 func Load(root string) (*Matcher, error) {
 	lines := append([]string(nil), defaultIgnoreLines...)
 
-	f, err := os.Open(filepath.Join(root, IgnoreFileName))
-	switch {
-	case err == nil:
-		defer func() { _ = f.Close() }()
-		scanner := bufio.NewScanner(f)
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, "#") {
-				continue
-			}
-			lines = append(lines, line)
-		}
-		err = scanner.Err()
+	for _, name := range []string{".gitignore", IgnoreFileName} {
+		fileLines, err := readLines(filepath.Join(root, name))
 		if err != nil {
 			return nil, err
 		}
-	case errors.Is(err, fs.ErrNotExist):
-		// fall through with defaults only
-	default:
-		return nil, err
+		lines = append(lines, fileLines...)
 	}
 
-	return &Matcher{inner: gi.CompileIgnoreLines(lines...)}, nil
+	return &Matcher{inner: gi.CompileIgnoreLines(lines...), relDir: ""}, nil
 }
 
-// Match returns true when relPath (forward-slash, repo-relative) is ignored.
-func (m *Matcher) Match(relPath string) bool {
-	return m.inner.MatchesPath(relPath)
+// dirMatcher loads .gitignore and .codesearchignore from the given directory
+// and returns a matcher scoped to it (relDir is dir relative to root).
+// Returns nil when neither file contributes any rules.
+func dirMatcher(root, dir string) *Matcher {
+	var lines []string
+	for _, name := range []string{".gitignore", IgnoreFileName} {
+		fileLines, _ := readLines(filepath.Join(dir, name))
+		lines = append(lines, fileLines...)
+	}
+	if len(lines) == 0 {
+		return nil
+	}
+
+	rel, err := filepath.Rel(root, dir)
+	if err != nil {
+		return nil
+	}
+	rel = filepath.ToSlash(rel)
+	if rel == "." {
+		rel = ""
+	}
+
+	return &Matcher{inner: gi.CompileIgnoreLines(lines...), relDir: rel}
+}
+
+func readLines(path string) ([]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	defer func() { _ = f.Close() }()
+
+	var lines []string
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return lines, scanner.Err()
+}
+
+// rel returns repoRel converted to a path relative to the matcher's directory,
+// along with true if repoRel is within that directory. For the root matcher
+// (relDir == "") every path is in scope.
+func (m *Matcher) rel(repoRel string) (string, bool) {
+	if m.relDir == "" {
+		return repoRel, true
+	}
+	prefix := m.relDir + "/"
+	if !strings.HasPrefix(repoRel, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(repoRel, prefix), true
+}
+
+// Match reports whether a repo-relative path is ignored by this matcher's
+// rules. Intended for the root matcher returned by Load.
+func (m *Matcher) Match(repoRel string) bool {
+	sub, ok := m.rel(repoRel)
+	if !ok {
+		return false
+	}
+	return m.inner.MatchesPath(sub)
 }
