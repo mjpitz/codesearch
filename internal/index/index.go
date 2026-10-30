@@ -99,6 +99,14 @@ func (i *Index) Upsert(d *doc.Doc) error {
 	return i.inner.Index(d.Path, d.Flatten())
 }
 
+func (i *Index) NewBatch() *bleve.Batch {
+	return i.inner.NewBatch()
+}
+
+func (i *Index) Batch(batch *bleve.Batch) error {
+	return i.inner.Batch(batch)
+}
+
 // Delete removes a document by ID (repo-relative path).
 func (i *Index) Delete(id string) error { return i.inner.Delete(id) }
 

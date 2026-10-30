@@ -35,6 +35,16 @@ type Result struct {
 	Unchanged int // fast-path skips (mtime + size matched stored)
 }
 
+type upsertInfo struct {
+	d       *doc.Doc
+	isTouch bool
+}
+
+type updatePlan struct {
+	toDelete []string
+	toUpsert []upsertInfo
+}
+
 // Run reconciles the filesystem with the index in cfg.IndexPath(). The
 // index must already exist (call init first). Returns a Result describing
 // the work performed.
@@ -77,6 +87,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 
 	var res Result
 	seen := make(map[string]bool, len(wanted))
+	plan := updatePlan{}
 
 	reconcile := func(s index.Stored) error {
 		ctxErr := ctx.Err()
@@ -85,10 +96,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 		}
 		entry, ok := wanted[s.Path]
 		if !ok {
-			delErr := idx.Delete(s.Path)
-			if delErr != nil {
-				return fmt.Errorf("delete %s: %w", s.Path, delErr)
-			}
+			plan.toDelete = append(plan.toDelete, s.Path)
 			res.Deleted++
 			return nil
 		}
@@ -118,15 +126,12 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 		d.Size = entry.Info.Size()
 		d.Digest = hash
 
-		upsertErr := idx.Upsert(d)
-		if upsertErr != nil {
-			return upsertErr
-		}
-
 		if hash == s.Digest {
 			res.Touched++
+			plan.toUpsert = append(plan.toUpsert, upsertInfo{d: d, isTouch: true})
 		} else {
 			res.Upserted++
+			plan.toUpsert = append(plan.toUpsert, upsertInfo{d: d, isTouch: false})
 		}
 		return nil
 	}
@@ -160,11 +165,43 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 		d.Size = entry.Info.Size()
 		d.Digest = src.For(entry.Path, body).String()
 
-		err = idx.Upsert(d)
-		if err != nil {
-			return res, err
-		}
+		plan.toUpsert = append(plan.toUpsert, upsertInfo{d: d, isTouch: false})
 		res.Upserted++
+	}
+
+	// Execute plan
+	if len(plan.toDelete) > 0 {
+		const batchSize = 1000
+		for i := 0; i < len(plan.toDelete); i += batchSize {
+			end := i + batchSize
+			if end > len(plan.toDelete) {
+				end = len(plan.toDelete)
+			}
+			batch := idx.NewBatch()
+			for _, path := range plan.toDelete[i:end] {
+				batch.Delete(path)
+			}
+			if err := idx.Batch(batch); err != nil {
+				return res, fmt.Errorf("batch delete: %w", err)
+			}
+		}
+	}
+
+	if len(plan.toUpsert) > 0 {
+		const batchSize = 1000
+		for i := 0; i < len(plan.toUpsert); i += batchSize {
+			end := i + batchSize
+			if end > len(plan.toUpsert) {
+				end = len(plan.toUpsert)
+			}
+			batch := idx.NewBatch()
+			for _, info := range plan.toUpsert[i:end] {
+				batch.Index(info.d.Path, info.d.Flatten())
+			}
+			if err := idx.Batch(batch); err != nil {
+				return res, fmt.Errorf("batch upsert: %w", err)
+			}
+		}
 	}
 
 	meta := Meta{
