@@ -21,6 +21,7 @@ func main() {
 			cmd.Serve,
 			cmd.Status,
 			cmd.Sync,
+			cmd.Watch,
 		},
 	}
 
