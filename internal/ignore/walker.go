@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 const (
@@ -27,6 +28,22 @@ type Entry struct {
 // walk; returning filepath.SkipDir from inside fn is not supported (use the
 // Matcher to exclude directories).
 type WalkFn func(Entry) error
+
+// WalkCache enables incremental walks that prune subtrees whose directory
+// mtime hasn't changed since the previous run.
+//
+// Pre-populate Prev with the directory mtimes recorded by the previous Walk
+// and set LastSyncAt to that run's completion time. After Walk returns, New
+// holds the current snapshot (to persist for the next run) and Pruned lists
+// directories whose entire subtree was skipped. When cache is nil, Walk
+// behaves identically to its pre-cache semantics.
+type WalkCache struct {
+	Prev       map[string]int64
+	LastSyncAt time.Time
+
+	New    map[string]int64
+	Pruned []string
+}
 
 // Walk iterates the filesystem under root, applying git-style ignore semantics:
 //
@@ -52,8 +69,16 @@ type WalkFn func(Entry) error
 //
 // rootMatcher should be the result of Load(root).
 //
+// When cache is non-nil, Walk prunes any subdirectory whose mtime matches
+// cache.Prev[rel] and predates cache.LastSyncAt — unless that directory holds
+// a .gitignore or .codesearchignore, which can be edited in place without
+// bumping the dir mtime and must always be re-scanned. cache.New records the
+// mtimes of every visited directory (including pruned ones), and pruned
+// descendants' mtimes are carried forward from cache.Prev so the cache
+// doesn't decay. The repo root itself is never prunable.
+//
 // Paths passed to fn are repo-relative with forward slashes.
-func Walk(root string, rootMatcher *Matcher, maxFileSize int64, fn WalkFn) error {
+func Walk(root string, rootMatcher *Matcher, maxFileSize int64, cache *WalkCache, fn WalkFn) error {
 	if maxFileSize == 0 {
 		maxFileSize = DefaultMaxFileSize
 	}
@@ -63,7 +88,11 @@ func Walk(root string, rootMatcher *Matcher, maxFileSize int64, fn WalkFn) error
 		stack = append(stack, rootMatcher)
 	}
 
-	return walkDir(root, root, stack, maxFileSize, fn)
+	if cache != nil && cache.New == nil {
+		cache.New = map[string]int64{}
+	}
+
+	return walkDir(root, root, stack, maxFileSize, cache, fn)
 }
 
 // isIgnored walks the matcher stack shallowest-to-deepest; the deepest matcher
@@ -92,8 +121,10 @@ func isIgnored(stack []*Matcher, repoRel string, isDir bool) bool {
 
 // walkDir recursively visits entries under dir. Any .gitignore /
 // .codesearchignore discovered in a subdirectory is pushed onto stack for the
-// duration of that subtree and popped before returning.
-func walkDir(dir, root string, stack []*Matcher, maxFileSize int64, fn WalkFn) error {
+// duration of that subtree and popped before returning. When cache is
+// non-nil, subtrees whose dir mtime hasn't changed since the last run are
+// pruned (see Walk's doc for rules).
+func walkDir(dir, root string, stack []*Matcher, maxFileSize int64, cache *WalkCache, fn WalkFn) error {
 	ents, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -115,16 +146,44 @@ func walkDir(dir, root string, stack []*Matcher, maxFileSize int64, fn WalkFn) e
 			if isIgnored(stack, rel, true) {
 				continue
 			}
-			if m := dirMatcher(root, path); m != nil {
+
+			m := dirMatcher(root, path)
+
+			if cache != nil {
+				info, ierr := ent.Info()
+				if ierr != nil {
+					return ierr
+				}
+				mtime := info.ModTime().UnixNano()
+				cache.New[rel] = mtime
+
+				// Dirs with ignore files can be edited in place
+				// without bumping their mtime, so never prune them.
+				if m == nil && cache.Prev != nil {
+					prev, ok := cache.Prev[rel]
+					if ok && prev == mtime && info.ModTime().Before(cache.LastSyncAt) {
+						prefix := rel + "/"
+						for k, v := range cache.Prev {
+							if strings.HasPrefix(k, prefix) {
+								cache.New[k] = v
+							}
+						}
+						cache.Pruned = append(cache.Pruned, rel)
+						continue
+					}
+				}
+			}
+
+			if m != nil {
 				stack = append(stack, m)
-				werr := walkDir(path, root, stack, maxFileSize, fn)
+				werr := walkDir(path, root, stack, maxFileSize, cache, fn)
 				stack = stack[:len(stack)-1]
 				if werr != nil {
 					return werr
 				}
 				continue
 			}
-			if werr := walkDir(path, root, stack, maxFileSize, fn); werr != nil {
+			if werr := walkDir(path, root, stack, maxFileSize, cache, fn); werr != nil {
 				return werr
 			}
 			continue

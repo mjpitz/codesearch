@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mjpitz/codesearch/internal/ignore"
 )
@@ -35,7 +36,7 @@ func collect(t *testing.T, root string, m *ignore.Matcher, maxSize int64) []stri
 		return nil
 	}
 
-	err := ignore.Walk(root, m, maxSize, collector)
+	err := ignore.Walk(root, m, maxSize, nil, collector)
 	if err != nil {
 		t.Fatalf("Walk: %v", err)
 	}
@@ -98,7 +99,7 @@ func TestWalk_UsesForwardSlashes(t *testing.T) {
 		return nil
 	}
 
-	err = ignore.Walk(root, m, 0, check)
+	err = ignore.Walk(root, m, 0, nil, check)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,4 +232,182 @@ func TestWalk_NestedAnchoredPatternScoped(t *testing.T) {
 	if !equal(got, want) {
 		t.Errorf("Walk paths = %v, want %v", got, want)
 	}
+}
+
+// walkWithCache runs Walk capturing both the file list and the cache state.
+func walkWithCache(t *testing.T, root string, m *ignore.Matcher, cache *ignore.WalkCache) []string {
+	t.Helper()
+
+	var out []string
+	err := ignore.Walk(root, m, 0, cache, func(e ignore.Entry) error {
+		out = append(out, e.Path)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("Walk: %v", err)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func TestWalk_PrunesUnchangedSubtree(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/a.go", []byte("package a"))
+	writeFile(t, root, "src/sub/b.go", []byte("package sub"))
+	writeFile(t, root, "docs/c.md", []byte("# c"))
+
+	m, err := ignore.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// First walk: no Prev, nothing is pruned, mtimes are captured.
+	cache1 := &ignore.WalkCache{}
+	_ = walkWithCache(t, root, m, cache1)
+	if len(cache1.Pruned) != 0 {
+		t.Fatalf("first walk Pruned = %v, want empty", cache1.Pruned)
+	}
+	if _, ok := cache1.New["src"]; !ok {
+		t.Fatalf("cache.New missing src: %v", cache1.New)
+	}
+
+	// Second walk after a short pause so LastSyncAt strictly exceeds every
+	// recorded mtime (racy-mtime guard requires strict Before).
+	time.Sleep(20 * time.Millisecond)
+	cache2 := &ignore.WalkCache{Prev: cache1.New, LastSyncAt: time.Now()}
+	got := walkWithCache(t, root, m, cache2)
+
+	// Files under src/ (which has no ignore file) should be pruned; docs
+	// has no ignore file either, so it's pruned too. The only entries
+	// walked are the ones directly under root (none here).
+	if !containsString(cache2.Pruned, "src") || !containsString(cache2.Pruned, "docs") {
+		t.Errorf("Pruned = %v, want src and docs", cache2.Pruned)
+	}
+	// Walked entries must not include anything under a pruned subtree.
+	for _, p := range got {
+		if strings.HasPrefix(p, "src/") || strings.HasPrefix(p, "docs/") {
+			t.Errorf("walked pruned path %q", p)
+		}
+	}
+}
+
+func TestWalk_DoesNotPruneWhenDirMtimeChanges(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/a.go", []byte("package a"))
+
+	m, err := ignore.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache1 := &ignore.WalkCache{}
+	_ = walkWithCache(t, root, m, cache1)
+
+	// Bump src/ mtime by creating a new file inside it (POSIX bumps parent
+	// dir mtime on child creat).
+	writeFile(t, root, "src/b.go", []byte("package a"))
+
+	time.Sleep(20 * time.Millisecond)
+	cache2 := &ignore.WalkCache{Prev: cache1.New, LastSyncAt: time.Now()}
+	got := walkWithCache(t, root, m, cache2)
+
+	if containsString(cache2.Pruned, "src") {
+		t.Errorf("src was pruned despite mtime change: %v", cache2.Pruned)
+	}
+	if !containsString(got, "src/b.go") {
+		t.Errorf("new file src/b.go not walked: %v", got)
+	}
+}
+
+func TestWalk_DoesNotPruneDirWithIgnoreFile(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/.gitignore", []byte("*.tmp\n"))
+	writeFile(t, root, "src/a.go", []byte("package a"))
+	writeFile(t, root, "docs/c.md", []byte("# c"))
+
+	m, err := ignore.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache1 := &ignore.WalkCache{}
+	_ = walkWithCache(t, root, m, cache1)
+
+	time.Sleep(20 * time.Millisecond)
+	cache2 := &ignore.WalkCache{Prev: cache1.New, LastSyncAt: time.Now()}
+	got := walkWithCache(t, root, m, cache2)
+
+	if containsString(cache2.Pruned, "src") {
+		t.Errorf("src pruned despite containing .gitignore: %v", cache2.Pruned)
+	}
+	if !containsString(cache2.Pruned, "docs") {
+		t.Errorf("docs should be pruned (no ignore file, unchanged): %v", cache2.Pruned)
+	}
+	if !containsString(got, "src/.gitignore") || !containsString(got, "src/a.go") {
+		t.Errorf("src was pruned by mistake, missing entries: %v", got)
+	}
+}
+
+func TestWalk_RacyMtimeGuard(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/a.go", []byte("package a"))
+
+	m, err := ignore.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache1 := &ignore.WalkCache{}
+	_ = walkWithCache(t, root, m, cache1)
+
+	// Set LastSyncAt equal to src's mtime — strict Before must refuse to
+	// prune on second-granularity filesystems where the dir could change
+	// within the same second as the previous sync.
+	srcMtime := time.Unix(0, cache1.New["src"])
+	cache2 := &ignore.WalkCache{Prev: cache1.New, LastSyncAt: srcMtime}
+	_ = walkWithCache(t, root, m, cache2)
+
+	if containsString(cache2.Pruned, "src") {
+		t.Errorf("racy-mtime guard failed: src pruned when mtime == LastSyncAt")
+	}
+}
+
+func TestWalk_PreservesDescendantMtimesOnPrune(t *testing.T) {
+	root := t.TempDir()
+	writeFile(t, root, "src/sub/a.go", []byte("package sub"))
+
+	m, err := ignore.Load(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cache1 := &ignore.WalkCache{}
+	_ = walkWithCache(t, root, m, cache1)
+
+	subMtime, ok := cache1.New["src/sub"]
+	if !ok {
+		t.Fatalf("cache1.New missing src/sub: %v", cache1.New)
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	cache2 := &ignore.WalkCache{Prev: cache1.New, LastSyncAt: time.Now()}
+	_ = walkWithCache(t, root, m, cache2)
+
+	if !containsString(cache2.Pruned, "src") {
+		t.Fatalf("expected src to be pruned, got %v", cache2.Pruned)
+	}
+	// src/sub was never visited this run but must survive in New so the
+	// NEXT run can still prune it.
+	if cache2.New["src/sub"] != subMtime {
+		t.Errorf("src/sub mtime not carried forward: got %d want %d", cache2.New["src/sub"], subMtime)
+	}
+}
+
+func containsString(xs []string, want string) bool {
+	for _, x := range xs {
+		if x == want {
+			return true
+		}
+	}
+	return false
 }

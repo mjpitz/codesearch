@@ -5,12 +5,16 @@ package sync
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/mjpitz/codesearch/internal/config"
@@ -22,8 +26,17 @@ import (
 
 // Meta is the JSON sidecar written next to the Bleve index.
 type Meta struct {
-	SchemaVersion int       `json:"schema_version"`
-	LastSyncAt    time.Time `json:"last_sync_at"`
+	SchemaVersion int              `json:"schema_version"`
+	LastSyncAt    time.Time        `json:"last_sync_at"`
+	MaxFileSize   int64            `json:"max_file_size,omitempty"`
+	IgnoreHash    string           `json:"ignore_hash,omitempty"`
+	Directories   map[string]int64 `json:"directories,omitempty"`
+}
+
+// RunOptions tunes a single Run invocation.
+type RunOptions struct {
+	// Full forces a full walk, ignoring the directory-mtime cache.
+	Full bool
 }
 
 // Result reports what a single Run did.
@@ -33,6 +46,7 @@ type Result struct {
 	Touched   int // unchanged bodies but mtime/size metadata refreshed
 	Deleted   int // index entries removed because the file is gone
 	Unchanged int // fast-path skips (mtime + size matched stored)
+	Pruned    int // subtrees skipped because dir mtime matched the cache
 }
 
 type upsertInfo struct {
@@ -48,7 +62,7 @@ type updatePlan struct {
 // Run reconciles the filesystem with the index in cfg.IndexPath(). The
 // index must already exist (call init first). Returns a Result describing
 // the work performed.
-func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
+func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result, error) {
 	err := ctx.Err()
 	if err != nil {
 		return Result{}, err
@@ -70,6 +84,23 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 	}
 	defer func() { _ = idx.Close() }()
 
+	prev, _ := ReadMeta(cfg.MetaPath())
+	ignoreHash, err := hashRootIgnoreFiles(cfg.Root)
+	if err != nil {
+		return Result{}, fmt.Errorf("hash ignore files: %w", err)
+	}
+
+	cache := &ignore.WalkCache{New: map[string]int64{}}
+	cacheValid := !opts.Full &&
+		prev.SchemaVersion == index.SchemaVersion &&
+		prev.MaxFileSize == cfg.MaxFileSize &&
+		prev.IgnoreHash == ignoreHash &&
+		prev.Directories != nil
+	if cacheValid {
+		cache.Prev = prev.Directories
+		cache.LastSyncAt = prev.LastSyncAt
+	}
+
 	wanted := map[string]ignore.Entry{}
 	collect := func(e ignore.Entry) error {
 		ctxErr := ctx.Err()
@@ -80,10 +111,16 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 		return nil
 	}
 
-	err = ignore.Walk(cfg.Root, matcher, cfg.MaxFileSize, collect)
+	err = ignore.Walk(cfg.Root, matcher, cfg.MaxFileSize, cache, collect)
 	if err != nil {
 		return Result{}, fmt.Errorf("walk: %w", err)
 	}
+
+	prunedPrefixes := make([]string, 0, len(cache.Pruned))
+	for _, p := range cache.Pruned {
+		prunedPrefixes = append(prunedPrefixes, p+"/")
+	}
+	sort.Strings(prunedPrefixes)
 
 	var res Result
 	seen := make(map[string]bool, len(wanted))
@@ -93,6 +130,12 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 		ctxErr := ctx.Err()
 		if ctxErr != nil {
 			return ctxErr
+		}
+		if isUnderPrunedPrefix(s.Path, prunedPrefixes) {
+			seen[s.Path] = true
+			res.Unchanged++
+			res.Pruned++
+			return nil
 		}
 		entry, ok := wanted[s.Path]
 		if !ok {
@@ -207,6 +250,9 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 	meta := Meta{
 		SchemaVersion: index.SchemaVersion,
 		LastSyncAt:    time.Now().UTC(),
+		MaxFileSize:   cfg.MaxFileSize,
+		IgnoreHash:    ignoreHash,
+		Directories:   cache.New,
 	}
 
 	err = WriteMeta(cfg.MetaPath(), meta)
@@ -215,6 +261,46 @@ func Run(ctx context.Context, cfg *config.IndexConfig) (Result, error) {
 	}
 
 	return res, nil
+}
+
+// hashRootIgnoreFiles returns a sha256 digest of the root .gitignore and
+// .codesearchignore contents (concatenated with a separator). Missing files
+// contribute nothing. The digest is stored in Meta to invalidate the
+// directory-prune cache when either file is edited — in-place edits to these
+// files don't bump their containing directory's mtime, so a dedicated
+// fingerprint is required to detect them.
+func hashRootIgnoreFiles(root string) (string, error) {
+	h := sha256.New()
+	for _, name := range []string{".gitignore", ignore.IgnoreFileName} {
+		data, err := os.ReadFile(filepath.Join(root, name))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				continue
+			}
+			return "", err
+		}
+		h.Write([]byte(name))
+		h.Write([]byte{0})
+		h.Write(data)
+		h.Write([]byte{0})
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// isUnderPrunedPrefix reports whether path lives beneath any of the sorted
+// prefixes (each prefix ends with "/" so src/foo doesn't shadow src/foobar).
+func isUnderPrunedPrefix(path string, prefixes []string) bool {
+	if len(prefixes) == 0 {
+		return false
+	}
+	i := sort.SearchStrings(prefixes, path)
+	if i > 0 && strings.HasPrefix(path, prefixes[i-1]) {
+		return true
+	}
+	if i < len(prefixes) && strings.HasPrefix(path, prefixes[i]) {
+		return true
+	}
+	return false
 }
 
 // ReadMeta returns the persisted Meta or an empty Meta if the file does
