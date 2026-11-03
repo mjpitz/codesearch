@@ -3,7 +3,6 @@ package watch
 import (
 	"context"
 	"fmt"
-	"io/fs"
 	"log"
 	"os"
 	"path/filepath"
@@ -20,6 +19,7 @@ import (
 type Watcher struct {
 	cfg             *config.IndexConfig
 	matcher         *ignore.Matcher
+	matchers        map[string]*ignore.Matcher // map of absolute path to matcher
 	debounceTimeout time.Duration
 	logger          *log.Logger
 	syncFunc        func(context.Context, *config.IndexConfig, syncpkg.RunOptions) (syncpkg.Result, error)
@@ -39,6 +39,7 @@ func NewWatcher(cfg *config.IndexConfig, matcher *ignore.Matcher, debounceTimeou
 	return &Watcher{
 		cfg:             cfg,
 		matcher:         matcher,
+		matchers:        make(map[string]*ignore.Matcher),
 		debounceTimeout: debounceTimeout,
 		logger:          logger,
 		syncFunc:        syncFunc,
@@ -71,9 +72,10 @@ func (w *Watcher) Run(ctx context.Context, paths []string) error {
 				if !ok {
 					return
 				}
-				if err := w.handleEvent(event); err != nil {
+				relevant, err := w.handleEvent(event)
+				if err != nil {
 					w.logger.Printf("event error: %v\n", err)
-				} else {
+				} else if relevant {
 					// If it's a relevant event, trigger sync
 					select {
 					case syncChan <- struct{}{}:
@@ -129,71 +131,158 @@ func (w *Watcher) Run(ctx context.Context, paths []string) error {
 }
 
 func (w *Watcher) addRecursive(root string) error {
-	return filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(w.cfg.Root, path)
-		if err != nil {
-			return err
-		}
-		rel = filepath.ToSlash(rel)
-
-		if w.matcher.Match(rel) {
-			if d.IsDir() {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-
-		if d.IsDir() {
-			w.mu.Lock()
-			if !w.watched[path] {
-				if err := w.watcher.Add(path); err != nil {
-					w.mu.Unlock()
-					return err
-				}
-				w.watched[path] = true
-			}
-			w.mu.Unlock()
-			return nil
-		}
-
-		return nil
-	})
-}
-
-func (w *Watcher) handleEvent(event fsnotify.Event) error {
-	path := event.Name
-
-	// Check if path is ignored
-	rel, err := filepath.Rel(w.cfg.Root, path)
+	rel, err := filepath.Rel(w.cfg.Root, root)
 	if err != nil {
 		return err
 	}
 	rel = filepath.ToSlash(rel)
 
-	if w.matcher.Match(rel) {
+	// Check if the root itself is ignored.
+	if ignore.IsIgnored([]*ignore.Matcher{w.matcher}, rel, true) {
 		return nil
+	}
+
+	w.mu.Lock()
+	if !w.watched[root] {
+		if err := w.watcher.Add(root); err != nil {
+			w.mu.Unlock()
+			return err
+		}
+		w.watched[root] = true
+	}
+	w.mu.Unlock()
+
+	return w.addRecursiveInternal(root, []*ignore.Matcher{w.matcher})
+}
+
+func (w *Watcher) addRecursiveInternal(path string, stack []*ignore.Matcher) error {
+	// 1. Check for a new matcher in this directory.
+	m := ignore.DirMatcher(w.cfg.Root, path)
+	newStack := stack
+	if m != nil {
+		w.mu.Lock()
+		w.matchers[path] = m
+		w.mu.Unlock()
+		newStack = append(stack, m)
+	}
+
+	// 2. Read the directory entries.
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return err
+	}
+
+	for _, entry := range entries {
+		childPath := filepath.Join(path, entry.Name())
+		rel, err := filepath.Rel(w.cfg.Root, childPath)
+		if err != nil {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+
+		if ignore.IsIgnored(newStack, rel, entry.IsDir()) {
+			continue
+		}
+
+		if entry.IsDir() {
+			w.mu.Lock()
+			if !w.watched[childPath] {
+				if err := w.watcher.Add(childPath); err != nil {
+					w.mu.Unlock()
+					return err
+				}
+				w.watched[childPath] = true
+			}
+			w.mu.Unlock()
+
+			if err := w.addRecursiveInternal(childPath, newStack); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (w *Watcher) getMatcherStack(path string) []*ignore.Matcher {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
+	var collected []*ignore.Matcher
+	curr := filepath.Dir(path)
+
+	for {
+		if m, ok := w.matchers[curr]; ok {
+			collected = append(collected, m)
+		}
+
+		if curr == w.cfg.Root || curr == "." || curr == "/" {
+			break
+		}
+
+		parent := filepath.Dir(curr)
+		if parent == curr {
+			break
+		}
+		curr = parent
+	}
+
+	stack := make([]*ignore.Matcher, 0, len(collected)+1)
+	stack = append(stack, w.matcher)
+	for i := len(collected) - 1; i >= 0; i-- {
+		stack = append(stack, collected[i])
+	}
+	return stack
+}
+
+func (w *Watcher) handleEvent(event fsnotify.Event) (bool, error) {
+	path := event.Name
+
+	// Handle ignore file changes
+	base := filepath.Base(path)
+	if base == ".gitignore" || base == ignore.IgnoreFileName {
+		dir := filepath.Dir(path)
+		m := ignore.DirMatcher(w.cfg.Root, dir)
+		w.mu.Lock()
+		if m != nil {
+			w.matchers[dir] = m
+		} else {
+			delete(w.matchers, dir)
+		}
+		w.mu.Unlock()
+		return true, nil
+	}
+
+	// Check if path is ignored
+	rel, err := filepath.Rel(w.cfg.Root, path)
+	if err != nil {
+		return false, err
+	}
+	rel = filepath.ToSlash(rel)
+
+	stack := w.getMatcherStack(path)
+	if ignore.IsIgnored(stack, rel, false) {
+		return false, nil
 	}
 
 	// Handle events
 	if event.Has(fsnotify.Create) {
 		info, err := os.Stat(path)
 		if err != nil {
-			return nil // Path might have been deleted already
+			return false, nil // Path might have been deleted already
 		}
 		if info.IsDir() {
-			return w.addRecursive(path)
+			if err := w.addRecursive(path); err != nil {
+				return false, err
+			}
 		}
 	}
 
 	if event.Has(fsnotify.Remove) || event.Has(fsnotify.Rename) {
 		w.mu.Lock()
 		delete(w.watched, path)
+		delete(w.matchers, path)
 		w.mu.Unlock()
 	}
 
-	return nil
+	return true, nil
 }

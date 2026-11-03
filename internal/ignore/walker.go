@@ -95,12 +95,12 @@ func Walk(root string, rootMatcher *Matcher, maxFileSize int64, cache *WalkCache
 	return walkDir(root, root, stack, maxFileSize, cache, fn)
 }
 
-// isIgnored walks the matcher stack shallowest-to-deepest; the deepest matcher
+// IsIgnored walks the matcher stack shallowest-to-deepest; the deepest matcher
 // that returns a non-nil pattern wins. A pattern is only returned when a
 // positive rule matched (go-gitignore does not surface pure-negation hits),
 // so pure negations at deeper levels cannot un-ignore files matched by
 // ancestors — see Walk's doc for the recommended workaround.
-func isIgnored(stack []*Matcher, repoRel string, isDir bool) bool {
+func IsIgnored(stack []*Matcher, repoRel string, isDir bool) bool {
 	probe := repoRel
 	if isDir {
 		probe += "/"
@@ -143,11 +143,11 @@ func walkDir(dir, root string, stack []*Matcher, maxFileSize int64, cache *WalkC
 		rel = filepath.ToSlash(rel)
 
 		if ent.IsDir() {
-			if isIgnored(stack, rel, true) {
+			if IsIgnored(stack, rel, true) {
 				continue
 			}
 
-			m := dirMatcher(root, path)
+			m := DirMatcher(root, path)
 
 			if cache != nil {
 				info, ierr := ent.Info()
@@ -189,7 +189,7 @@ func walkDir(dir, root string, stack []*Matcher, maxFileSize int64, cache *WalkC
 			continue
 		}
 
-		if isIgnored(stack, rel, false) {
+		if IsIgnored(stack, rel, false) {
 			continue
 		}
 

@@ -47,10 +47,10 @@ func Load(root string) (*Matcher, error) {
 	return &Matcher{inner: gi.CompileIgnoreLines(lines...), relDir: ""}, nil
 }
 
-// dirMatcher loads .gitignore and .codesearchignore from the given directory
+// DirMatcher loads .gitignore and .codesearchignore from the given directory
 // and returns a matcher scoped to it (relDir is dir relative to root).
 // Returns nil when neither file contributes any rules.
-func dirMatcher(root, dir string) *Matcher {
+func DirMatcher(root, dir string) *Matcher {
 	var lines []string
 	for _, name := range []string{".gitignore", IgnoreFileName} {
 		fileLines, _ := readLines(filepath.Join(dir, name))
