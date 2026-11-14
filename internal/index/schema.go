@@ -46,5 +46,6 @@ func BuildMapping() *mapping.IndexMappingImpl {
 
 	m := bleve.NewIndexMapping()
 	m.DefaultMapping = doc
+
 	return m
 }

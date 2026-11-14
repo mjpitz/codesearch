@@ -51,12 +51,28 @@ var Init = &cli.Command{
 			LastSyncAt:    time.Time{},
 		}
 
+		embedder, err := index.NewEmbedder()
+		if err != nil {
+			return fmt.Errorf("embedder: %w", err)
+		}
+
+		if embedder != nil {
+			vec, embedErr := embedder.Embed(ctx, "hello")
+			if embedErr != nil {
+				_, _ = fmt.Fprintf(os.Stderr, "warning: embedder probe failed: %v\n", embedErr)
+			} else {
+				meta.VectorDim = len(vec)
+				_, _ = fmt.Fprintf(os.Stdout, "embedder configured: dim=%d\n", meta.VectorDim)
+			}
+		}
+
 		err = sync.WriteMeta(cfg.MetaPath(), meta)
 		if err != nil {
 			return err
 		}
 
 		_, _ = fmt.Fprintf(os.Stdout, "created index at %s\n", cfg.IndexPath())
+
 		return nil
 	},
 }

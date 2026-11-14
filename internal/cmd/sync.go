@@ -6,6 +6,7 @@ import (
 	"os"
 
 	"github.com/mjpitz/codesearch/internal/config"
+	"github.com/mjpitz/codesearch/internal/index"
 	"github.com/mjpitz/codesearch/internal/sync"
 	"github.com/urfave/cli/v3"
 )
@@ -25,12 +26,20 @@ var Sync = &cli.Command{
 		if err != nil {
 			return err
 		}
-		res, err := sync.Run(ctx, cfg, sync.RunOptions{Full: c.Bool("full")})
+
+		embedder, err := index.NewEmbedder()
+		if err != nil {
+			return fmt.Errorf("embedder: %w", err)
+		}
+
+		res, err := sync.Run(ctx, cfg, sync.RunOptions{Full: c.Bool("full"), Embedder: embedder})
 		if err != nil {
 			return err
 		}
+
 		_, _ = fmt.Fprintf(os.Stdout, "sync complete: scanned=%d upserted=%d touched=%d deleted=%d unchanged=%d pruned=%d\n",
 			res.Scanned, res.Upserted, res.Touched, res.Deleted, res.Unchanged, res.Pruned)
+
 		return nil
 	},
 }

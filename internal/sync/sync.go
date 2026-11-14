@@ -11,11 +11,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"time"
+
+	chromem "github.com/philippgille/chromem-go"
 
 	"github.com/mjpitz/codesearch/internal/config"
 	"github.com/mjpitz/codesearch/internal/digest"
@@ -31,12 +34,16 @@ type Meta struct {
 	MaxFileSize   int64            `json:"max_file_size,omitempty"`
 	IgnoreHash    string           `json:"ignore_hash,omitempty"`
 	Directories   map[string]int64 `json:"directories,omitempty"`
+	VectorDim     int              `json:"vector_dim,omitempty"` // 0 = no embeddings
 }
 
 // RunOptions tunes a single Run invocation.
 type RunOptions struct {
 	// Full forces a full walk, ignoring the directory-mtime cache.
 	Full bool
+	// Embedder, when non-nil, generates vector embeddings for new or changed
+	// documents during sync. Touch-only docs are skipped (content unchanged).
+	Embedder index.Embedder
 }
 
 // Result reports what a single Run did.
@@ -85,6 +92,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 	defer func() { _ = idx.Close() }()
 
 	prev, _ := ReadMeta(cfg.MetaPath())
+
 	ignoreHash, err := hashRootIgnoreFiles(cfg.Root)
 	if err != nil {
 		return Result{}, fmt.Errorf("hash ignore files: %w", err)
@@ -131,18 +139,21 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 		if ctxErr != nil {
 			return ctxErr
 		}
+
 		if isUnderPrunedPrefix(s.Path, prunedPrefixes) {
 			seen[s.Path] = true
 			res.Unchanged++
 			res.Pruned++
 			return nil
 		}
+
 		entry, ok := wanted[s.Path]
 		if !ok {
 			plan.toDelete = append(plan.toDelete, s.Path)
 			res.Deleted++
 			return nil
 		}
+
 		seen[s.Path] = true
 
 		mtime := float64(entry.Info.ModTime().UnixNano())
@@ -159,6 +170,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 		if readErr != nil {
 			return fmt.Errorf("read %s: %w", entry.Path, readErr)
 		}
+
 		hash := src.For(entry.Path, body).String()
 
 		d, parseErr := doc.FromBytes(entry.Path, body)
@@ -176,6 +188,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 			res.Upserted++
 			plan.toUpsert = append(plan.toUpsert, upsertInfo{d: d, isTouch: false})
 		}
+
 		return nil
 	}
 
@@ -212,6 +225,19 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 		res.Upserted++
 	}
 
+	// Open chromem-go vector store once if an embedder is configured.
+	var col *chromem.Collection
+	if opts.Embedder != nil {
+		db, dbErr := chromem.NewPersistentDB(cfg.VectorStorePath(), false)
+		if dbErr != nil {
+			return res, fmt.Errorf("open vector store: %w", dbErr)
+		}
+		col, dbErr = db.GetOrCreateCollection("codesearch", nil, nil)
+		if dbErr != nil {
+			return res, fmt.Errorf("get vector collection: %w", dbErr)
+		}
+	}
+
 	// Execute plan
 	if len(plan.toDelete) > 0 {
 		const batchSize = 1000
@@ -220,10 +246,18 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 			if end > len(plan.toDelete) {
 				end = len(plan.toDelete)
 			}
+
 			batch := idx.NewBatch()
 			for _, path := range plan.toDelete[i:end] {
 				batch.Delete(path)
+
+				if col != nil {
+					if delErr := col.Delete(ctx, nil, nil, path); delErr != nil {
+						log.Printf("vector delete %s: %v", path, delErr)
+					}
+				}
 			}
+
 			if err := idx.Batch(batch); err != nil {
 				return res, fmt.Errorf("batch delete: %w", err)
 			}
@@ -237,10 +271,30 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 			if end > len(plan.toUpsert) {
 				end = len(plan.toUpsert)
 			}
+
 			batch := idx.NewBatch()
 			for _, info := range plan.toUpsert[i:end] {
 				batch.Index(info.d.Path, info.d.Flatten())
+
+				if col != nil && !info.isTouch {
+					vec, embedErr := opts.Embedder.Embed(ctx, embedText(info.d))
+					if embedErr != nil {
+						log.Printf("embed %s: %v (skipping)", info.d.Path, embedErr)
+					} else if prev.VectorDim > 0 && len(vec) != prev.VectorDim {
+						log.Printf("embed %s: dim %d != expected %d (skipping)", info.d.Path, len(vec), prev.VectorDim)
+					} else {
+						if addErr := col.AddDocument(ctx, chromem.Document{
+							ID:        info.d.Path,
+							Embedding: vec,
+						}); addErr != nil {
+							log.Printf("vector add %s: %v (skipping)", info.d.Path, addErr)
+						} else if prev.VectorDim == 0 {
+							prev.VectorDim = len(vec)
+						}
+					}
+				}
 			}
+
 			if err := idx.Batch(batch); err != nil {
 				return res, fmt.Errorf("batch upsert: %w", err)
 			}
@@ -253,6 +307,7 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 		MaxFileSize:   cfg.MaxFileSize,
 		IgnoreHash:    ignoreHash,
 		Directories:   cache.New,
+		VectorDim:     prev.VectorDim,
 	}
 
 	err = WriteMeta(cfg.MetaPath(), meta)
@@ -261,6 +316,20 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 	}
 
 	return res, nil
+}
+
+// embedText builds the string passed to the embedder for a document.
+// The path is included so filename-based semantic queries ("auth middleware")
+// can match even when the file body is terse.
+func embedText(d *doc.Doc) string {
+	const maxBytes = 8192
+
+	text := d.Path + "\n" + d.Title + "\n" + d.Body
+	if len(text) > maxBytes {
+		text = text[:maxBytes]
+	}
+
+	return text
 }
 
 // hashRootIgnoreFiles returns a sha256 digest of the root .gitignore and
@@ -284,6 +353,7 @@ func hashRootIgnoreFiles(root string) (string, error) {
 		h.Write(data)
 		h.Write([]byte{0})
 	}
+
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
@@ -293,13 +363,17 @@ func isUnderPrunedPrefix(path string, prefixes []string) bool {
 	if len(prefixes) == 0 {
 		return false
 	}
+
 	i := sort.SearchStrings(prefixes, path)
+
 	if i > 0 && strings.HasPrefix(path, prefixes[i-1]) {
 		return true
 	}
+
 	if i < len(prefixes) && strings.HasPrefix(path, prefixes[i]) {
 		return true
 	}
+
 	return false
 }
 

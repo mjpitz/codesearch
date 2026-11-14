@@ -36,6 +36,7 @@ func Create(path string) (*Index, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return &Index{inner: inner, path: path}, nil
 }
 
@@ -71,17 +72,20 @@ func openWithTimeout(path string, readOnly bool) (*Index, error) {
 		inner bleve.Index
 		err   error
 	)
+
 	if readOnly {
 		inner, err = bleve.OpenUsing(path, map[string]any{"read_only": true})
 	} else {
 		inner, err = bleve.Open(path)
 	}
+
 	if err != nil {
 		if errors.Is(err, bbolterrors.ErrTimeout) {
 			return nil, fmt.Errorf("%w (%s): %v", ErrIndexLocked, path, err)
 		}
 		return nil, err
 	}
+
 	return &Index{inner: inner, path: path}, nil
 }
 
@@ -136,8 +140,10 @@ func (i *Index) Iterate(fn func(Stored) error) error {
 		if err != nil {
 			return err
 		}
+
 		for _, hit := range result.Hits {
 			s := Stored{Path: hit.ID}
+
 			if v, ok := hit.Fields["digest"].(string); ok {
 				s.Digest = v
 			}
@@ -147,14 +153,17 @@ func (i *Index) Iterate(fn func(Stored) error) error {
 			if v, ok := hit.Fields["size"].(float64); ok {
 				s.Size = v
 			}
+
 			err = fn(s)
 			if err != nil {
 				return err
 			}
 		}
+
 		if len(result.Hits) < pageSize {
 			return nil
 		}
+
 		from += pageSize
 	}
 }

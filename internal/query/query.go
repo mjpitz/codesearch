@@ -3,6 +3,8 @@
 package query
 
 import (
+	"sort"
+
 	"github.com/blevesearch/bleve/v2"
 	"github.com/blevesearch/bleve/v2/search/query"
 
@@ -20,6 +22,10 @@ type Request struct {
 	NoSnippet bool               // disable highlight extraction
 	Boosts    map[string]float64 // field -> boost (only applied when > 0)
 	Highlight string             // "ansi", "html", or "" (empty disables)
+	// VectorRanking is an optional pre-computed path→rank map (1-indexed,
+	// 1 = most similar) from a vector search. When non-nil, Search merges
+	// it with BM25 results using Reciprocal Rank Fusion (k=60).
+	VectorRanking map[string]int
 }
 
 // Hit is one ranked search result.
@@ -48,12 +54,27 @@ var defaultBoostedFields = map[string]float64{
 	"body":  1.0,
 }
 
-// Search runs the request against idx and returns ranked hits.
+// Search runs the request against idx and returns ranked hits. When
+// req.VectorRanking is non-nil, results are merged with BM25 via RRF (k=60).
 func Search(idx *index.Index, req Request) (*Result, error) {
 	if req.Limit <= 0 {
 		req.Limit = 10
 	}
 
+	textResult, err := textSearch(idx, req)
+	if err != nil {
+		return nil, err
+	}
+
+	if req.VectorRanking == nil {
+		return textResult, nil
+	}
+
+	return mergeRRF(textResult, req.VectorRanking, req.Limit), nil
+}
+
+// textSearch runs the BM25 query and returns ranked hits.
+func textSearch(idx *index.Index, req Request) (*Result, error) {
 	boosts := req.Boosts
 	if len(boosts) == 0 {
 		boosts = defaultBoostedFields
@@ -96,9 +117,11 @@ func Search(idx *index.Index, req Request) (*Result, error) {
 			Score: h.Score,
 			Frags: h.Fragments,
 		}
+
 		if v, ok := h.Fields["title"].(string); ok {
 			hit.Title = v
 		}
+
 		switch tags := h.Fields["tags"].(type) {
 		case []any:
 			for _, t := range tags {
@@ -111,10 +134,76 @@ func Search(idx *index.Index, req Request) (*Result, error) {
 		case string:
 			hit.Tags = []string{tags}
 		}
+
 		hit.Snippet = firstFragment(h.Fragments, "body", "description", "title")
+
 		out.Hits = append(out.Hits, hit)
 	}
+
 	return out, nil
+}
+
+// mergeRRF combines text search results with a pre-computed vector ranking
+// using Reciprocal Rank Fusion (k=60). Documents in only one list get a
+// fallback rank of len(thatList)+1.
+func mergeRRF(textResult *Result, vectorRanking map[string]int, limit int) *Result {
+	const k = 60
+
+	textRanking := make(map[string]int, len(textResult.Hits))
+	for i, h := range textResult.Hits {
+		textRanking[h.Path] = i + 1
+	}
+
+	seen := make(map[string]bool, len(textRanking)+len(vectorRanking))
+	for p := range textRanking {
+		seen[p] = true
+	}
+	for p := range vectorRanking {
+		seen[p] = true
+	}
+
+	textFallback := len(textRanking) + 1
+	vecFallback := len(vectorRanking) + 1
+
+	type scored struct {
+		path  string
+		score float64
+	}
+
+	merged := make([]scored, 0, len(seen))
+	for p := range seen {
+		tr, vr := textRanking[p], vectorRanking[p]
+		if tr == 0 {
+			tr = textFallback
+		}
+		if vr == 0 {
+			vr = vecFallback
+		}
+		merged = append(merged, scored{p, 1/float64(k+tr) + 1/float64(k+vr)})
+	}
+
+	sort.Slice(merged, func(i, j int) bool { return merged[i].score > merged[j].score })
+
+	hitByPath := make(map[string]Hit, len(textResult.Hits))
+	for _, h := range textResult.Hits {
+		hitByPath[h.Path] = h
+	}
+
+	if limit > len(merged) {
+		limit = len(merged)
+	}
+
+	out := &Result{Total: uint64(len(seen))}
+	for _, s := range merged[:limit] {
+		if h, ok := hitByPath[s.path]; ok {
+			h.Score = s.score
+			out.Hits = append(out.Hits, h)
+		} else {
+			out.Hits = append(out.Hits, Hit{Path: s.path, Score: s.score})
+		}
+	}
+
+	return out
 }
 
 func buildTermsQuery(terms string, boosts map[string]float64) query.Query {
@@ -128,6 +217,7 @@ func buildTermsQuery(terms string, boosts map[string]float64) query.Query {
 		mq.SetBoost(boost)
 		dq.AddQuery(mq)
 	}
+
 	return dq
 }
 
@@ -137,5 +227,6 @@ func firstFragment(frags map[string][]string, fields ...string) string {
 			return list[0]
 		}
 	}
+
 	return ""
 }

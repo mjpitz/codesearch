@@ -49,6 +49,7 @@ func FindRoot(start string) (string, error) {
 		}
 		start = cwd
 	}
+
 	abs, err := filepath.Abs(start)
 	if err != nil {
 		return "", err
@@ -65,10 +66,12 @@ func FindRoot(start string) (string, error) {
 				return "", statErr
 			}
 		}
+
 		parent := filepath.Dir(cur)
 		if parent == cur {
 			return "", fmt.Errorf("no .git or .codesearch directory found at or above %s; run 'codesearch init' to create one", abs)
 		}
+
 		cur = parent
 	}
 }
@@ -88,6 +91,7 @@ func Load(start string) (*IndexConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	return newConfig(root), nil
 }
 
@@ -100,6 +104,7 @@ func LoadOrInit(start string) (*IndexConfig, error) {
 	if err == nil {
 		return cfg, nil
 	}
+
 	if start == "" {
 		cwd, cwdErr := os.Getwd()
 		if cwdErr != nil {
@@ -107,10 +112,12 @@ func LoadOrInit(start string) (*IndexConfig, error) {
 		}
 		start = cwd
 	}
+
 	abs, absErr := filepath.Abs(start)
 	if absErr != nil {
 		return nil, absErr
 	}
+
 	return newConfig(abs), nil
 }
 
@@ -130,3 +137,6 @@ func (c *IndexConfig) IndexPath() string { return filepath.Join(c.IndexDir(), In
 
 // MetaPath is the JSON sidecar location inside IndexDir.
 func (c *IndexConfig) MetaPath() string { return filepath.Join(c.IndexDir(), MetaFileName) }
+
+// VectorStorePath is the chromem-go directory for vector embeddings.
+func (c *IndexConfig) VectorStorePath() string { return filepath.Join(c.IndexDir(), "vectors") }
