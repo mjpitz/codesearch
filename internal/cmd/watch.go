@@ -9,6 +9,7 @@ import (
 
 	"github.com/mjpitz/codesearch/internal/config"
 	"github.com/mjpitz/codesearch/internal/ignore"
+	"github.com/mjpitz/codesearch/internal/index"
 	syncpkg "github.com/mjpitz/codesearch/internal/sync"
 	"github.com/mjpitz/codesearch/internal/watch"
 	"github.com/urfave/cli/v3"
@@ -68,7 +69,17 @@ var Watch = &cli.Command{
 			return fmt.Errorf("additional ignore patterns via --ignore are not yet supported")
 		}
 
-		w, err := watch.NewWatcher(cfg, matcher, c.Duration("debounce"), logger, syncpkg.Run)
+		embedder, err := index.NewEmbedder()
+		if err != nil {
+			return fmt.Errorf("embedder: %w", err)
+		}
+
+		syncWithEmbedder := func(ctx context.Context, cfg *config.IndexConfig, opts syncpkg.RunOptions) (syncpkg.Result, error) {
+			opts.Embedder = embedder
+			return syncpkg.Run(ctx, cfg, opts)
+		}
+
+		w, err := watch.NewWatcher(cfg, matcher, c.Duration("debounce"), logger, syncWithEmbedder)
 		if err != nil {
 			return err
 		}

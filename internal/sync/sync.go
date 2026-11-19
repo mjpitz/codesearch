@@ -301,13 +301,18 @@ func Run(ctx context.Context, cfg *config.IndexConfig, opts RunOptions) (Result,
 		}
 	}
 
+	vectorDim := 0
+	if opts.Embedder != nil {
+		vectorDim = prev.VectorDim
+	}
+
 	meta := Meta{
 		SchemaVersion: index.SchemaVersion,
 		LastSyncAt:    time.Now().UTC(),
 		MaxFileSize:   cfg.MaxFileSize,
 		IgnoreHash:    ignoreHash,
 		Directories:   cache.New,
-		VectorDim:     prev.VectorDim,
+		VectorDim:     vectorDim,
 	}
 
 	err = WriteMeta(cfg.MetaPath(), meta)
